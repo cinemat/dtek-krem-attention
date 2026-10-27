@@ -1,0 +1,12 @@
+{
+  "name": "dtek-krem-attention",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "scrape": "node scrape.mjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "playwright": "1.64.0"
+  }
+}
