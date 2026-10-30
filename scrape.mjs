@@ -1,7 +1,10 @@
 // Відкриває сторінку ДТЕК КРЕМ у headless Chromium і передає текст поп-апу «Шановні клієнти!»
-// (#modal-attention) у Worker light-checker. Рішення про сповіщення приймає Worker.
+// (#modal-attention) у Worker light-checker, а також статус нашої адреси з тієї ж сторінки
+// (`getHomeNum`, форма «Перевірка поточних відключень за адресою»). Рішення про сповіщення приймає Worker.
 //
 // Env: WORKER_URL, ATTENTION_TOKEN (секрети GitHub Actions). DRY_RUN=1 — лише надрукувати текст.
+// ADDRESS_CITY, ADDRESS_STREET, ADDRESS_HOUSE — адреса як у підказках форми на сайті (секрети, бо репозиторій
+// публічний); якщо не задано — адресу не перевіряємо.
 // Запуск: node scrape.mjs [url]   (url — для перевірки на локальному файлі)
 
 import { chromium } from 'playwright';
@@ -21,6 +24,46 @@ export function extractAttention() {
   return text || null;
 }
 
+/**
+ * Виконується в браузері: відключення за адресою з `POST /ua/ajax method=getHomeNum` (той самий запит робить
+ * форма на сторінці). { sub_type, start_date, end_date, updated } або null, якщо даних немає.
+ */
+export async function extractHome({ city, street, house }) {
+  const csrf = document.querySelector('meta[name=csrf-token]')?.content;
+  if (!csrf) return null;
+  const body = new URLSearchParams({
+    method: 'getHomeNum',
+    'data[0][name]': 'city',
+    'data[0][value]': city,
+    'data[1][name]': 'street',
+    'data[1][value]': street,
+  });
+  const r = await fetch('/ua/ajax', {
+    method: 'POST',
+    headers: {
+      'X-CSRF-Token': csrf,
+      'X-Requested-With': 'XMLHttpRequest',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    },
+    body: body.toString(),
+  });
+  if (!r.ok) return null;
+  const j = await r.json();
+  const h = j?.result && j.data?.[house];
+  if (!h) return null;
+  return {
+    sub_type: h.sub_type || null,
+    start_date: h.start_date || null,
+    end_date: h.end_date || null,
+    updated: j.updateTimestamp || null,
+  };
+}
+
+function addressFromEnv() {
+  const { ADDRESS_CITY: city, ADDRESS_STREET: street, ADDRESS_HOUSE: house } = process.env;
+  return city && street && house ? { city, street, house } : null;
+}
+
 /** Сторінка справжня, а не заглушка Incapsula: є дані графіка. */
 function looksLoaded(html) {
   return html.includes('DisconSchedule.fact');
@@ -28,7 +71,7 @@ function looksLoaded(html) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function scrape(url) {
+async function scrape(url, address) {
   const browser = await chromium.launch({ headless: true });
   try {
     const ctx = await browser.newContext({
@@ -41,7 +84,20 @@ async function scrape(url) {
       try {
         await page.goto(url, { waitUntil: 'networkidle', timeout: 90_000 });
         await page.waitForTimeout(500);
-        if (looksLoaded(await page.content())) return { text: await page.evaluate(extractAttention) };
+        if (looksLoaded(await page.content())) {
+          const text = await page.evaluate(extractAttention);
+          let home = null;
+          if (address) {
+            // Збій запиту адреси не скасовує звіт про поп-ап: home = null — Worker стан адреси не чіпає.
+            try {
+              home = await page.evaluate(extractHome, address);
+            } catch (e) {
+              console.warn(`[WARN] адреса: ${e?.message || e}`);
+            }
+            if (!home) console.warn('[WARN] адреса: даних немає');
+          }
+          return { text, home };
+        }
         console.warn(`[WARN] спроба ${attempt}: сторінка без даних (ймовірно, заглушка Incapsula)`);
       } catch (e) {
         console.warn(`[WARN] спроба ${attempt}: ${e?.message || e}`);
@@ -57,13 +113,14 @@ async function scrape(url) {
 }
 
 async function main() {
-  const res = await scrape(PAGE_URL);
+  const res = await scrape(PAGE_URL, addressFromEnv());
   if (!res) {
     // Не звітуємо: Worker сам попередить власника, якщо звітів нема понад 3 год.
     console.error('[ERROR] сторінку не завантажено');
     process.exit(1);
   }
   console.log(`[OK] поп-ап: ${res.text === null ? '— (нема)' : JSON.stringify(res.text)}`);
+  console.log(`[OK] адреса: ${res.home === null ? '— (не перевірено)' : JSON.stringify(res.home)}`);
   if (process.env.DRY_RUN === '1') return;
 
   const { WORKER_URL, ATTENTION_TOKEN } = process.env;
@@ -71,7 +128,7 @@ async function main() {
   const r = await fetch(new URL('/ingest/attention', WORKER_URL), {
     method: 'POST',
     headers: { authorization: `Bearer ${ATTENTION_TOKEN}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ text: res.text }),
+    body: JSON.stringify({ text: res.text, home: res.home }),
     signal: AbortSignal.timeout(30_000),
   });
   const body = await r.text();
